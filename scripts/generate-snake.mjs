@@ -1,23 +1,29 @@
 #!/usr/bin/env node
 /**
- * Growing contribution snake.
+ * Growing contribution snake that rebuilds the graph into a name.
  *
- * Fetches a user's GitHub contribution calendar, runs a snake that eats the
- * contribution dots and grows longer as it eats, and renders the run as an
- * animated SVG (CSS animations only, so it works inside <img> on the GitHub
- * profile page).
+ * Phase 1: the snake eats the contribution dots (lightest color first, darker
+ * cells act as walls, like the original snk) and grows longer as it eats.
+ * Phase 2: it writes WORD onto the grid by laying cubes behind itself,
+ * shrinking as it sheds them.
+ *
+ * Renders as an animated SVG (CSS animations only, so it works inside <img>
+ * on the GitHub profile page).
  *
  * Usage: node scripts/generate-snake.mjs <github-user> <out-dir>
  */
+
+const WORD = "VINCENT";
 
 const CELL = 16; // cell pitch in px
 const DOT = 12; // dot size in px
 const DOT_RADIUS = 2;
 const STEP_MS = 100; // time per snake step
-const PAUSE_MS = 4000; // hold at the end before the loop restarts
+const PAUSE_MS = 6000; // hold the finished word before the loop restarts
 const START_LEN = 4; // snake length at spawn, in cells
 const MAX_LEN = 30; // growth cap, in cells
 const GROW_EVERY = 3; // grow one cell every N dots eaten
+const SHED_EVERY = 2; // shrink one cell every N cubes laid
 const PAD = 4; // cells of off-grid margin the snake may roam
 const MAX_STEPS = 8000;
 
@@ -25,15 +31,24 @@ const PALETTES = {
   light: {
     empty: "#ebedf0",
     levels: ["#9be9a8", "#40c463", "#30a14e", "#216e39"],
-    snake: "#7c3aed",
-    background: "transparent",
+    snake: "purple",
+    word: "#216e39",
   },
   dark: {
     empty: "#161b22",
     levels: ["#0e4429", "#006d32", "#26a641", "#39d353"],
-    snake: "#a78bfa",
-    background: "transparent",
+    snake: "purple",
+    word: "#39d353",
   },
+};
+
+const FONT = {
+  V: ["X...X", "X...X", "X...X", ".X.X.", "..X.."],
+  I: ["XXX", ".X.", ".X.", ".X.", "XXX"],
+  N: ["X..X", "XX.X", "X.XX", "X..X", "X..X"],
+  C: [".XXX", "X...", "X...", "X...", ".XXX"],
+  E: ["XXX", "X..", "XXX", "X..", "XXX"],
+  T: ["XXX", ".X.", ".X.", ".X.", ".X."],
 };
 
 const key = (x, y) => `${x},${y}`;
@@ -67,16 +82,46 @@ async function fetchCalendar(user) {
   });
 }
 
+// Letter cell groups, left to right, centered on the grid.
+function wordTargets(width) {
+  const glyphs = [...WORD].map((ch) => {
+    const glyph = FONT[ch];
+    if (!glyph) throw new Error(`no glyph for "${ch}"`);
+    return glyph;
+  });
+  const wordWidth =
+    glyphs.reduce((sum, g) => sum + g[0].length, 0) + glyphs.length - 1;
+  let x0 = Math.max(0, Math.floor((width - wordWidth) / 2));
+  const groups = [];
+  for (const glyph of glyphs) {
+    const group = [];
+    glyph.forEach((row, dy) => {
+      [...row].forEach((px, dx) => {
+        if (px === "X") group.push({ x: x0 + dx, y: 1 + dy });
+      });
+    });
+    groups.push(group);
+    x0 += glyph[0].length + 1;
+  }
+  return groups;
+}
+
 function solve(cells) {
   const width = Math.max(...cells.map((c) => c.x)) + 1;
   const dots = new Map(
     cells.filter((c) => c.level > 0).map((c) => [key(c.x, c.y), c.level]),
   );
+  const letterGroups = wordTargets(width);
+  const letterSet = new Set(
+    letterGroups.flat().map((c) => key(c.x, c.y)),
+  );
+  // Letter cells survive: the word is carved out of the graph as the snake
+  // eats everything around it.
+  const edible = new Map(
+    [...dots].filter(([k]) => !letterSet.has(k)),
+  );
   const inBounds = (x, y) =>
     x >= -PAD && x < width + PAD && y >= -PAD && y < 7 + PAD;
-  // Like the original snk: clear the lightest remaining color first, while
-  // darker (higher-level) cells act as walls the snake must route around.
-  const currentLevel = () => Math.min(...dots.values());
 
   let body = Array.from({ length: START_LEN }, (_, i) => ({
     x: -1 - i,
@@ -84,25 +129,34 @@ function solve(cells) {
   }));
   const chain = [body[0]];
   const eats = []; // { step, x, y }
+  const deposits = []; // { step, x, y }
   const lengths = [{ step: 0, len: body.length }];
   let eaten = 0;
+  let laid = 0;
   let pendingGrowth = 0;
 
-  const bfsToNearestDot = (level, strictWalls) => {
-    const blocked = new Set(body.map((p) => key(p.x, p.y)));
-    const queue = [body[0]];
+  // BFS from the head to the nearest cell satisfying isTarget, avoiding
+  // walls. A body cell j segments from the head blocks the path only if the
+  // path would arrive before the tail has vacated it. Returns the path
+  // excluding the head, or null.
+  const bfs = (isTarget, isWall) => {
+    const bodyIndex = new Map(body.map((p, j) => [key(p.x, p.y), j]));
+    const queue = [{ ...body[0], d: 0 }];
     const cameFrom = new Map([[key(body[0].x, body[0].y), null]]);
     while (queue.length > 0) {
       const cur = queue.shift();
       for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
         const nx = cur.x + dx;
         const ny = cur.y + dy;
+        const d = cur.d + 1;
         const k = key(nx, ny);
-        if (!inBounds(nx, ny) || blocked.has(k) || cameFrom.has(k)) continue;
-        if (strictWalls && (dots.get(k) ?? 0) > level) continue;
+        if (!inBounds(nx, ny) || cameFrom.has(k)) continue;
+        const j = bodyIndex.get(k);
+        if (j !== undefined && d < body.length - j + pendingGrowth) continue;
+        if (isWall(k) && !isTarget(k)) continue;
         cameFrom.set(k, cur);
         const next = { x: nx, y: ny };
-        if (dots.get(k) === level) {
+        if (isTarget(k)) {
           const path = [next];
           let back = cur;
           while (back && cameFrom.get(key(back.x, back.y)) !== null) {
@@ -111,7 +165,7 @@ function solve(cells) {
           }
           return path;
         }
-        queue.push(next);
+        queue.push({ ...next, d });
       }
     }
     return null;
@@ -139,17 +193,9 @@ function solve(cells) {
     return best ? [best] : null;
   };
 
-  const advance = (cell) => {
+  const advance = (cell, onCell) => {
     body.unshift(cell);
-    const k = key(cell.x, cell.y);
-    if (dots.has(k)) {
-      dots.delete(k);
-      eaten += 1;
-      if (eaten % GROW_EVERY === 0 && body.length + pendingGrowth <= MAX_LEN) {
-        pendingGrowth += 1;
-      }
-      eats.push({ step: chain.length, x: cell.x, y: cell.y });
-    }
+    onCell(cell);
     if (pendingGrowth > 0) {
       pendingGrowth -= 1;
       lengths.push({ step: chain.length, len: body.length });
@@ -159,17 +205,93 @@ function solve(cells) {
     chain.push(cell);
   };
 
-  while (dots.size > 0 && chain.length < MAX_STEPS) {
-    const level = currentLevel();
+  const onEat = ({ x, y }) => {
+    const k = key(x, y);
+    if (!letterSet.has(k) && edible.delete(k)) {
+      dots.delete(k);
+      eaten += 1;
+      if (eaten % GROW_EVERY === 0 && body.length + pendingGrowth <= MAX_LEN) {
+        pendingGrowth += 1;
+      }
+      eats.push({ step: chain.length, x, y });
+    }
+  };
+
+  // Phase 1: eat everything except the word, lightest color first; darker
+  // cells and letter cells act as walls.
+  while (edible.size > 0 && chain.length < MAX_STEPS) {
+    const level = Math.min(...edible.values());
+    const isLevel = (k) => edible.get(k) === level;
+    const isWall = (k) =>
+      letterSet.has(k) || (edible.get(k) ?? 0) > level;
     const path =
-      bfsToNearestDot(level, true) ?? bfsToNearestDot(level, false) ?? wander();
+      bfs(isLevel, isWall) ??
+      bfs(isLevel, (k) => letterSet.has(k)) ??
+      wander();
     if (!path) break;
     for (const cell of path) {
-      advance(cell);
+      advance(cell, onEat);
       if (chain.length >= MAX_STEPS) break;
     }
   }
-  return { width, chain, eats, lengths, dotsLeft: dots.size };
+
+  // Phase 2: patch the letter pixels that had no contribution, laying a cube
+  // on each and shedding length as it goes.
+  for (const group of letterGroups) {
+    const remaining = new Set(
+      group.filter((c) => !dots.has(key(c.x, c.y))).map((c) => key(c.x, c.y)),
+    );
+    while (remaining.size > 0 && chain.length < MAX_STEPS) {
+      const isWall = (k) => letterSet.has(k) && !remaining.has(k);
+      const path =
+        bfs((k) => remaining.has(k), isWall) ??
+        bfs((k) => remaining.has(k), () => false) ??
+        wander();
+      if (!path) break;
+      for (const cell of path) {
+        advance(cell, ({ x, y }) => {
+          onEat({ x, y });
+          if (remaining.delete(key(x, y))) {
+            laid += 1;
+            deposits.push({ step: chain.length, x, y });
+            if (laid % SHED_EVERY === 0 && body.length > START_LEN) {
+              body.pop();
+              lengths.push({ step: chain.length, len: body.length });
+            }
+          }
+        });
+        if (chain.length >= MAX_STEPS) break;
+      }
+    }
+  }
+
+  // Phase 3: slither off the right edge so the finished word stays clean.
+  {
+    const exitX = width + 3;
+    const exitKeys = new Set();
+    for (let y = -PAD; y < 7 + PAD; y += 1) exitKeys.add(key(exitX, y));
+    const path =
+      bfs((k) => exitKeys.has(k), (k) => letterSet.has(k)) ??
+      bfs((k) => exitKeys.has(k), () => false);
+    for (const cell of path ?? []) advance(cell, () => {});
+  }
+
+  // Letter cells that kept their original dot flash to the word color once
+  // the snake has left.
+  const keepers = letterGroups
+    .flat()
+    .filter((c) => dots.has(key(c.x, c.y)))
+    .map((c) => key(c.x, c.y));
+
+  return {
+    width,
+    chain,
+    eats,
+    deposits,
+    lengths,
+    keepers,
+    dotsLeft: edible.size,
+  };
 }
 
 const fmtPct = (n) => Number(n.toFixed(3));
@@ -181,76 +303,119 @@ const vchain = (chain, i) => (i >= 0 ? chain[i] : { x: -1 + i, y: -1 });
 function snakeSegmentStyles(solved, stepPct, totalMs) {
   const { chain, lengths } = solved;
   const lastStep = chain.length - 1;
-  const turns = [0];
+  const turns = [];
   for (let i = 1; i < lastStep; i += 1) {
     const a = chain[i - 1];
     const b = chain[i];
     const c = chain[i + 1];
     if (b.x - a.x !== c.x - b.x || b.y - a.y !== c.y - b.y) turns.push(i);
   }
-  turns.push(lastStep);
 
-  const finalLen = lengths[lengths.length - 1].len;
+  const maxLen = Math.max(...lengths.map(({ len }) => len));
   const styles = [];
-  for (let j = 0; j < finalLen; j += 1) {
+  for (let j = 0; j < maxLen; j += 1) {
     const birth =
       j < START_LEN ? 0 : lengths.find(({ len }) => len >= j + 1).step;
+    const death =
+      lengths.find(({ step, len }) => step > birth && len <= j)?.step ?? null;
+    const endStep = death ?? lastStep;
     const at = (step) => {
       const p = vchain(chain, step - j);
-      return `transform:translate(${p.x * CELL + (CELL - DOT) / 2}px,${p.y * CELL + (CELL - DOT) / 2}px)`;
+      return `transform:translate(${p.x * CELL}px,${p.y * CELL}px)`;
     };
-    const steps = [
-      birth,
-      ...turns.map((s) => s + j).filter((s) => s > birth && s < lastStep),
-      lastStep,
-    ];
-    const frames = steps.map((s) => `${stepPct(s)}%{${at(s)}}`);
+    const frames = [];
     if (birth > 0) {
-      frames.unshift(
-        `0%,${fmtPct(stepPct(birth) - 0.01)}%{opacity:0;${at(birth)}}${stepPct(birth)}%{opacity:1}`,
+      frames.push(
+        `0%,${fmtPct(stepPct(birth) - 0.01)}%{opacity:0;${at(birth)}}`,
+        `${stepPct(birth)}%{opacity:1;${at(birth)}}`,
+      );
+    } else {
+      frames.push(`0%{${at(0)}}`);
+    }
+    frames.push(
+      ...turns
+        .map((s) => s + j)
+        .filter((s) => s > birth && s < endStep)
+        .map((s) => `${stepPct(s)}%{${at(s)}}`),
+    );
+    if (death !== null) {
+      frames.push(
+        `${stepPct(death)}%{opacity:1;${at(death)}}`,
+        `${fmtPct(stepPct(death) + 0.01)}%,100%{opacity:0;${at(death)}}`,
+      );
+    } else {
+      // Fade out once the snake has slithered off-grid so the word holds.
+      frames.push(
+        `${stepPct(lastStep)}%{opacity:1;${at(lastStep)}}`,
+        `${fmtPct(stepPct(lastStep) + 0.5)}%,100%{opacity:0;${at(lastStep)}}`,
       );
     }
-    frames.push(`100%{${at(lastStep)}}`);
     styles.push(
       `@keyframes s${j}{${frames.join("")}}` +
         `.s${j}{animation:s${j} ${totalMs}ms linear infinite}`,
     );
   }
-  return { styles, finalLen };
+  return { styles, maxLen };
 }
 
 function renderSvg(cells, solved, palette) {
-  const { width, chain, eats } = solved;
-  const travelMs = (chain.length - 1) * STEP_MS;
+  const { width, chain, eats, deposits, keepers } = solved;
+  const lastStep = chain.length - 1;
+  const travelMs = lastStep * STEP_MS;
   const totalMs = travelMs + PAUSE_MS;
   const stepPct = (step) => fmtPct(((step * STEP_MS) / totalMs) * 100);
 
   const dotRects = [];
-  const dotFrames = [];
+  const frames = [];
   const eatStepByKey = new Map(eats.map((e) => [key(e.x, e.y), e.step]));
+  const keeperSet = new Set(keepers);
   cells.forEach((c, i) => {
     const x = c.x * CELL + (CELL - DOT) / 2;
     const y = c.y * CELL + (CELL - DOT) / 2;
     const fill = c.level > 0 ? palette.levels[c.level - 1] : palette.empty;
     const eatStep = eatStepByKey.get(key(c.x, c.y));
-    const cls = eatStep === undefined ? "" : ` class="d${i}"`;
+    const isKeeper = keeperSet.has(key(c.x, c.y));
+    const animated = eatStep !== undefined || isKeeper;
+    const cls = animated ? ` class="d${i}"` : "";
     dotRects.push(
       `<rect${cls} x="${x}" y="${y}" width="${DOT}" height="${DOT}" rx="${DOT_RADIUS}" fill="${fill}"/>`,
     );
     if (eatStep !== undefined) {
       const p = stepPct(eatStep);
-      dotFrames.push(
+      frames.push(
         `@keyframes d${i}{0%,${p}%{fill:${fill}}${fmtPct(p + 0.01)}%,100%{fill:${palette.empty}}}` +
+          `.d${i}{animation:d${i} ${totalMs}ms linear infinite}`,
+      );
+    } else if (isKeeper) {
+      const p = stepPct(lastStep);
+      frames.push(
+        `@keyframes d${i}{0%,${p}%{fill:${fill}}${fmtPct(p + 0.5)}%,100%{fill:${palette.word}}}` +
           `.d${i}{animation:d${i} ${totalMs}ms linear infinite}`,
       );
     }
   });
 
-  const { styles, finalLen } = snakeSegmentStyles(solved, stepPct, totalMs);
-  const segments = Array.from({ length: finalLen }, (_, j) => {
-    // Tail segments shade slightly toward transparent like the original.
-    const alpha = j === 0 ? 1 : Math.max(0.5, 1 - j * 0.02);
-    return `<rect class="s${j}" width="${DOT}" height="${DOT}" rx="${DOT_RADIUS + 2}" fill="${palette.snake}" fill-opacity="${alpha}"/>`;
+  const depositRects = deposits.map(({ step, x, y }, i) => {
+    const p = stepPct(step);
+    frames.push(
+      `@keyframes w${i}{0%,${fmtPct(p - 0.01)}%{opacity:0}${p}%,100%{opacity:1}}` +
+        `.w${i}{animation:w${i} ${totalMs}ms linear infinite}`,
+    );
+    return `<rect class="w${i}" x="${x * CELL + (CELL - DOT) / 2}" y="${y * CELL + (CELL - DOT) / 2}" width="${DOT}" height="${DOT}" rx="${DOT_RADIUS}" fill="${palette.word}"/>`;
+  });
+
+  const { styles, maxLen } = snakeSegmentStyles(solved, stepPct, totalMs);
+  // Same sizing as the original snk: a slightly bigger head tapering down
+  // over the first four segments, uniform color.
+  const segments = Array.from({ length: maxLen }, (_, j) => {
+    const dMin = DOT * 0.8;
+    const dMax = CELL * 0.9;
+    const iMax = Math.min(4, maxLen);
+    const u = (1 - Math.min(j, iMax) / iMax) ** 2;
+    const s = dMin + u * (dMax - dMin);
+    const m = ((CELL - s) / 2).toFixed(1);
+    const r = Math.min(4.5, (4 * s) / DOT).toFixed(1);
+    return `<rect class="s${j}" x="${m}" y="${m}" width="${s.toFixed(1)}" height="${s.toFixed(1)}" rx="${r}" fill="${palette.snake}"/>`;
   }).reverse();
 
   const w = width * CELL;
@@ -259,12 +424,10 @@ function renderSvg(cells, solved, palette) {
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${-CELL} ${-CELL} ${w + 2 * CELL} ${h + 2 * CELL}" width="${w + 2 * CELL}" height="${h + 2 * CELL}">`,
     `<style>`,
     styles.join(""),
-    dotFrames.join(""),
+    frames.join(""),
     `</style>`,
-    palette.background === "transparent"
-      ? ""
-      : `<rect x="${-CELL}" y="${-CELL}" width="${w + 2 * CELL}" height="${h + 2 * CELL}" fill="${palette.background}"/>`,
     dotRects.join(""),
+    depositRects.join(""),
     segments.join(""),
     `</svg>`,
   ].join("\n");
@@ -281,8 +444,9 @@ async function main() {
   const solved = solve(cells);
   console.log(
     `grid ${solved.width}x7, ${solved.chain.length} steps, ` +
-      `${solved.eats.length} dots eaten, ${solved.dotsLeft} unreachable, ` +
-      `final length ${solved.lengths[solved.lengths.length - 1].len} cells`,
+      `${solved.eats.length} dots eaten (${solved.dotsLeft} unreachable), ` +
+      `${solved.deposits.length} cubes laid, ` +
+      `peak length ${Math.max(...solved.lengths.map(({ len }) => len))} cells`,
   );
   await mkdir(outDir, { recursive: true });
   await writeFile(
