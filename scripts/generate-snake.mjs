@@ -105,8 +105,16 @@ function wordTargets(width) {
 
 function solve(cells) {
   const width = Math.max(...cells.map((c) => c.x)) + 1;
+  // Cells where the word will be spelled are off-limits to the snake for the
+  // whole run, so it routes around the letters instead of sliding over them.
+  // Dots under the letters are never eaten; the deposits cover them.
+  const wordKeys = new Set(
+    wordTargets(width).flat().map(({ x, y }) => key(x, y)),
+  );
   const dots = new Map(
-    cells.filter((c) => c.level > 0).map((c) => [key(c.x, c.y), c.level]),
+    cells
+      .filter((c) => c.level > 0 && !wordKeys.has(key(c.x, c.y)))
+      .map((c) => [key(c.x, c.y), c.level]),
   );
   const inBounds = (x, y) =>
     x >= -PAD && x < width + PAD && y >= -PAD && y < 7 + PAD;
@@ -135,6 +143,7 @@ function solve(cells) {
         const d = cur.d + 1;
         const k = key(nx, ny);
         if (!inBounds(nx, ny) || cameFrom.has(k)) continue;
+        if (wordKeys.has(k)) continue; // never enter the word area, even in ghost mode
         const j = bodyIndex.get(k);
         if (!ghost && j !== undefined && d < body.length - j) continue;
         if (isWall(k) && !isTarget(k)) continue;
@@ -174,7 +183,12 @@ function solve(cells) {
       bfs(isLevel, isWall) ??
       bfs(isLevel, () => false) ??
       bfs(isLevel, () => false, true);
-    if (!path) break;
+    if (!path) {
+      // Nothing at this level is reachable around the word; skip the level
+      // instead of abandoning the rest of the graph.
+      for (const [k, v] of dots) if (v === level) dots.delete(k);
+      continue;
+    }
     for (const cell of path) {
       advance(cell);
       if (chain.length >= MAX_STEPS) break;
