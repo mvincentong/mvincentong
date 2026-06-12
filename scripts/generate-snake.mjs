@@ -139,7 +139,7 @@ function solve(cells) {
   // walls. A body cell j segments from the head blocks the path only if the
   // path would arrive before the tail has vacated it. Returns the path
   // excluding the head, or null.
-  const bfs = (isTarget, isWall) => {
+  const bfs = (isTarget, isWall, ghost = false) => {
     const bodyIndex = new Map(body.map((p, j) => [key(p.x, p.y), j]));
     const queue = [{ ...body[0], d: 0 }];
     const cameFrom = new Map([[key(body[0].x, body[0].y), null]]);
@@ -152,7 +152,13 @@ function solve(cells) {
         const k = key(nx, ny);
         if (!inBounds(nx, ny) || cameFrom.has(k)) continue;
         const j = bodyIndex.get(k);
-        if (j !== undefined && d < body.length - j + pendingGrowth) continue;
+        if (
+          !ghost &&
+          j !== undefined &&
+          d < body.length - j + pendingGrowth
+        ) {
+          continue;
+        }
         if (isWall(k) && !isTarget(k)) continue;
         cameFrom.set(k, cur);
         const next = { x: nx, y: ny };
@@ -172,7 +178,12 @@ function solve(cells) {
   };
 
   const wander = () => {
-    const blocked = new Set(body.map((p) => key(p.x, p.y)));
+    // The tail vacates this step, so following it is always legal.
+    const blocked = new Set(
+      body
+        .slice(0, pendingGrowth > 0 ? body.length : -1)
+        .map((p) => key(p.x, p.y)),
+    );
     let best = null;
     let bestFree = -1;
     for (const [dx, dy] of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
@@ -217,35 +228,61 @@ function solve(cells) {
     }
   };
 
-  // Phase 1: eat everything except the word, lightest color first; darker
-  // cells and letter cells act as walls.
-  while (edible.size > 0 && chain.length < MAX_STEPS) {
-    const level = Math.min(...edible.values());
-    const isLevel = (k) => edible.get(k) === level;
-    const isWall = (k) =>
-      letterSet.has(k) || (edible.get(k) ?? 0) > level;
-    const path =
-      bfs(isLevel, isWall) ??
-      bfs(isLevel, (k) => letterSet.has(k)) ??
-      wander();
-    if (!path) break;
-    for (const cell of path) {
-      advance(cell, onEat);
-      if (chain.length >= MAX_STEPS) break;
-    }
-  }
+  // The word forms letter by letter: the grid is split into one column band
+  // per letter, and for each band the snake eats the band's dots (lightest
+  // first, darker cells and letter cells as walls), then completes the
+  // letter by laying cubes on its missing pixels before moving right.
+  const bands = letterGroups.map((g) => ({
+    minX: Math.min(...g.map((c) => c.x)),
+    maxX: Math.max(...g.map((c) => c.x)),
+  }));
+  const keepers = []; // { k, step } letter dots flashing as letters finish
+  let bandStart = -PAD;
+  for (let i = 0; i < letterGroups.length; i += 1) {
+    const bandEnd =
+      i < bands.length - 1
+        ? Math.ceil((bands[i].maxX + bands[i + 1].minX) / 2) + 1
+        : width + PAD;
+    const inBand = (k) => {
+      const x = Number(k.split(",")[0]);
+      return x >= bandStart && x < bandEnd;
+    };
 
-  // Phase 2: patch the letter pixels that had no contribution, laying a cube
-  // on each and shedding length as it goes.
-  for (const group of letterGroups) {
+    // Eat this band.
+    while (chain.length < MAX_STEPS) {
+      const levels = [...edible]
+        .filter(([k]) => inBand(k))
+        .map(([, level]) => level);
+      if (levels.length === 0) break;
+      const level = Math.min(...levels);
+      const isTarget = (k) => inBand(k) && edible.get(k) === level;
+      const isWall = (k) =>
+        letterSet.has(k) ||
+        (edible.has(k) && (!inBand(k) || edible.get(k) > level));
+      const path =
+        bfs(isTarget, isWall) ??
+        bfs(isTarget, (k) => letterSet.has(k)) ??
+        bfs(isTarget, (k) => letterSet.has(k), true) ??
+        wander();
+      if (!path) break;
+      for (const cell of path) {
+        advance(cell, onEat);
+        if (chain.length >= MAX_STEPS) break;
+      }
+    }
+
+    // Complete this letter.
     const remaining = new Set(
-      group.filter((c) => !dots.has(key(c.x, c.y))).map((c) => key(c.x, c.y)),
+      letterGroups[i]
+        .filter((c) => !dots.has(key(c.x, c.y)))
+        .map((c) => key(c.x, c.y)),
     );
     while (remaining.size > 0 && chain.length < MAX_STEPS) {
       const isWall = (k) => letterSet.has(k) && !remaining.has(k);
       const path =
         bfs((k) => remaining.has(k), isWall) ??
         bfs((k) => remaining.has(k), () => false) ??
+        bfs((k) => remaining.has(k), () => false, true) ??
         wander();
       if (!path) break;
       for (const cell of path) {
@@ -263,25 +300,27 @@ function solve(cells) {
         if (chain.length >= MAX_STEPS) break;
       }
     }
+
+    // The letter is done: its surviving dots flash to the word color now.
+    const doneStep = chain.length - 1;
+    for (const c of letterGroups[i]) {
+      const k = key(c.x, c.y);
+      if (dots.has(k)) keepers.push({ k, step: doneStep });
+    }
+    bandStart = bandEnd;
   }
 
-  // Phase 3: slither off the right edge so the finished word stays clean.
+  // Finally: slither off the right edge so the finished word stays clean.
   {
     const exitX = width + 3;
     const exitKeys = new Set();
     for (let y = -PAD; y < 7 + PAD; y += 1) exitKeys.add(key(exitX, y));
     const path =
       bfs((k) => exitKeys.has(k), (k) => letterSet.has(k)) ??
-      bfs((k) => exitKeys.has(k), () => false);
+      bfs((k) => exitKeys.has(k), () => false) ??
+      bfs((k) => exitKeys.has(k), () => false, true);
     for (const cell of path ?? []) advance(cell, () => {});
   }
-
-  // Letter cells that kept their original dot flash to the word color once
-  // the snake has left.
-  const keepers = letterGroups
-    .flat()
-    .filter((c) => dots.has(key(c.x, c.y)))
-    .map((c) => key(c.x, c.y));
 
   return {
     width,
@@ -368,14 +407,14 @@ function renderSvg(cells, solved, palette) {
   const dotRects = [];
   const frames = [];
   const eatStepByKey = new Map(eats.map((e) => [key(e.x, e.y), e.step]));
-  const keeperSet = new Set(keepers);
+  const keeperStepByKey = new Map(keepers.map(({ k, step }) => [k, step]));
   cells.forEach((c, i) => {
     const x = c.x * CELL + (CELL - DOT) / 2;
     const y = c.y * CELL + (CELL - DOT) / 2;
     const fill = c.level > 0 ? palette.levels[c.level - 1] : palette.empty;
     const eatStep = eatStepByKey.get(key(c.x, c.y));
-    const isKeeper = keeperSet.has(key(c.x, c.y));
-    const animated = eatStep !== undefined || isKeeper;
+    const keeperStep = keeperStepByKey.get(key(c.x, c.y));
+    const animated = eatStep !== undefined || keeperStep !== undefined;
     const cls = animated ? ` class="d${i}"` : "";
     dotRects.push(
       `<rect${cls} x="${x}" y="${y}" width="${DOT}" height="${DOT}" rx="${DOT_RADIUS}" fill="${fill}"/>`,
@@ -386,8 +425,8 @@ function renderSvg(cells, solved, palette) {
         `@keyframes d${i}{0%,${p}%{fill:${fill}}${fmtPct(p + 0.01)}%,100%{fill:${palette.empty}}}` +
           `.d${i}{animation:d${i} ${totalMs}ms linear infinite}`,
       );
-    } else if (isKeeper) {
-      const p = stepPct(lastStep);
+    } else if (keeperStep !== undefined) {
+      const p = stepPct(keeperStep);
       frames.push(
         `@keyframes d${i}{0%,${p}%{fill:${fill}}${fmtPct(p + 0.5)}%,100%{fill:${palette.word}}}` +
           `.d${i}{animation:d${i} ${totalMs}ms linear infinite}`,
