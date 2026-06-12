@@ -70,10 +70,13 @@ async function fetchCalendar(user) {
 function solve(cells) {
   const width = Math.max(...cells.map((c) => c.x)) + 1;
   const dots = new Map(
-    cells.filter((c) => c.level > 0).map((c) => [key(c.x, c.y), c]),
+    cells.filter((c) => c.level > 0).map((c) => [key(c.x, c.y), c.level]),
   );
   const inBounds = (x, y) =>
     x >= -PAD && x < width + PAD && y >= -PAD && y < 7 + PAD;
+  // Like the original snk: clear the lightest remaining color first, while
+  // darker (higher-level) cells act as walls the snake must route around.
+  const currentLevel = () => Math.min(...dots.values());
 
   let body = Array.from({ length: START_LEN }, (_, i) => ({
     x: -1 - i,
@@ -85,7 +88,7 @@ function solve(cells) {
   let eaten = 0;
   let pendingGrowth = 0;
 
-  const bfsToNearestDot = () => {
+  const bfsToNearestDot = (level, strictWalls) => {
     const blocked = new Set(body.map((p) => key(p.x, p.y)));
     const queue = [body[0]];
     const cameFrom = new Map([[key(body[0].x, body[0].y), null]]);
@@ -96,9 +99,10 @@ function solve(cells) {
         const ny = cur.y + dy;
         const k = key(nx, ny);
         if (!inBounds(nx, ny) || blocked.has(k) || cameFrom.has(k)) continue;
+        if (strictWalls && (dots.get(k) ?? 0) > level) continue;
         cameFrom.set(k, cur);
         const next = { x: nx, y: ny };
-        if (dots.has(k)) {
+        if (dots.get(k) === level) {
           const path = [next];
           let back = cur;
           while (back && cameFrom.get(key(back.x, back.y)) !== null) {
@@ -156,7 +160,9 @@ function solve(cells) {
   };
 
   while (dots.size > 0 && chain.length < MAX_STEPS) {
-    const path = bfsToNearestDot() ?? wander();
+    const level = currentLevel();
+    const path =
+      bfsToNearestDot(level, true) ?? bfsToNearestDot(level, false) ?? wander();
     if (!path) break;
     for (const cell of path) {
       advance(cell);
@@ -166,11 +172,55 @@ function solve(cells) {
   return { width, chain, eats, lengths, dotsLeft: dots.size };
 }
 
-const px = (cell) => cell * CELL + CELL / 2;
 const fmtPct = (n) => Number(n.toFixed(3));
 
+// Head position at step i; negative i extends the spawn line off-grid so
+// tail segments have somewhere to be before the head has moved j steps.
+const vchain = (chain, i) => (i >= 0 ? chain[i] : { x: -1 + i, y: -1 });
+
+function snakeSegmentStyles(solved, stepPct, totalMs) {
+  const { chain, lengths } = solved;
+  const lastStep = chain.length - 1;
+  const turns = [0];
+  for (let i = 1; i < lastStep; i += 1) {
+    const a = chain[i - 1];
+    const b = chain[i];
+    const c = chain[i + 1];
+    if (b.x - a.x !== c.x - b.x || b.y - a.y !== c.y - b.y) turns.push(i);
+  }
+  turns.push(lastStep);
+
+  const finalLen = lengths[lengths.length - 1].len;
+  const styles = [];
+  for (let j = 0; j < finalLen; j += 1) {
+    const birth =
+      j < START_LEN ? 0 : lengths.find(({ len }) => len >= j + 1).step;
+    const at = (step) => {
+      const p = vchain(chain, step - j);
+      return `transform:translate(${p.x * CELL + (CELL - DOT) / 2}px,${p.y * CELL + (CELL - DOT) / 2}px)`;
+    };
+    const steps = [
+      birth,
+      ...turns.map((s) => s + j).filter((s) => s > birth && s < lastStep),
+      lastStep,
+    ];
+    const frames = steps.map((s) => `${stepPct(s)}%{${at(s)}}`);
+    if (birth > 0) {
+      frames.unshift(
+        `0%,${fmtPct(stepPct(birth) - 0.01)}%{opacity:0;${at(birth)}}${stepPct(birth)}%{opacity:1}`,
+      );
+    }
+    frames.push(`100%{${at(lastStep)}}`);
+    styles.push(
+      `@keyframes s${j}{${frames.join("")}}` +
+        `.s${j}{animation:s${j} ${totalMs}ms linear infinite}`,
+    );
+  }
+  return { styles, finalLen };
+}
+
 function renderSvg(cells, solved, palette) {
-  const { width, chain, eats, lengths } = solved;
+  const { width, chain, eats } = solved;
   const travelMs = (chain.length - 1) * STEP_MS;
   const totalMs = travelMs + PAUSE_MS;
   const stepPct = (step) => fmtPct(((step * STEP_MS) / totalMs) * 100);
@@ -196,34 +246,26 @@ function renderSvg(cells, solved, palette) {
     }
   });
 
-  const points = chain.map((c) => `${px(c.x)},${px(c.y)}`).join(" ");
-  const pathLen = (chain.length - 1) * CELL;
-  // Visible dash window is [d - L, d] where d = head travel distance and
-  // L = body length; stroke-dashoffset = L - d keeps the window on the head.
-  const frame = (step, len) =>
-    `${stepPct(step)}%{stroke-dashoffset:${len * CELL - step * CELL}px;stroke-dasharray:${len * CELL}px ${pathLen + MAX_LEN * CELL}px}`;
-  const lastStep = chain.length - 1;
-  const lastLen = lengths[lengths.length - 1].len;
-  const snakeFrames = [
-    ...lengths.map(({ step, len }) => frame(step, len)),
-    frame(lastStep, lastLen),
-    `100%{stroke-dashoffset:${lastLen * CELL - lastStep * CELL}px;stroke-dasharray:${lastLen * CELL}px ${pathLen + MAX_LEN * CELL}px}`,
-  ].join("");
+  const { styles, finalLen } = snakeSegmentStyles(solved, stepPct, totalMs);
+  const segments = Array.from({ length: finalLen }, (_, j) => {
+    // Tail segments shade slightly toward transparent like the original.
+    const alpha = j === 0 ? 1 : Math.max(0.5, 1 - j * 0.02);
+    return `<rect class="s${j}" width="${DOT}" height="${DOT}" rx="${DOT_RADIUS + 2}" fill="${palette.snake}" fill-opacity="${alpha}"/>`;
+  }).reverse();
 
   const w = width * CELL;
   const h = 7 * CELL;
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${-CELL} ${-CELL} ${w + 2 * CELL} ${h + 2 * CELL}" width="${w + 2 * CELL}" height="${h + 2 * CELL}">`,
     `<style>`,
-    `@keyframes snake{${snakeFrames}}`,
-    `.snake{animation:snake ${totalMs}ms linear infinite}`,
+    styles.join(""),
     dotFrames.join(""),
     `</style>`,
     palette.background === "transparent"
       ? ""
       : `<rect x="${-CELL}" y="${-CELL}" width="${w + 2 * CELL}" height="${h + 2 * CELL}" fill="${palette.background}"/>`,
     dotRects.join(""),
-    `<polyline class="snake" points="${points}" fill="none" stroke="${palette.snake}" stroke-width="${DOT}" stroke-linecap="round" stroke-linejoin="round"/>`,
+    segments.join(""),
     `</svg>`,
   ].join("\n");
 }
