@@ -192,14 +192,16 @@ function solve(cells) {
     for (const cell of path ?? []) advance(cell);
   }
 
-  // The word appears letter by letter, keyed to eating progress: letter i
-  // pops in once (i+1)/n of the dots have been eaten.
-  const letterGroups = wordTargets(width);
-  const deposits = [];
-  letterGroups.forEach((group, i) => {
-    const milestone = Math.ceil(((i + 1) / letterGroups.length) * eats.length);
+  // The word appears cube by cube, keyed to eating progress: the m-th word
+  // cube (letters left to right, each letter drawn column by column) pops in
+  // once (m+1)/total of the dots have been eaten.
+  const wordCells = wordTargets(width).flatMap((group) =>
+    [...group].sort((a, b) => a.x - b.x || a.y - b.y),
+  );
+  const deposits = wordCells.map(({ x, y }, m) => {
+    const milestone = Math.ceil(((m + 1) / wordCells.length) * eats.length);
     const step = eats[Math.max(0, milestone - 1)]?.step ?? chain.length - 1;
-    for (const { x, y } of group) deposits.push({ step, x, y });
+    return { step, x, y };
   });
 
   return { width, chain, eats, deposits, dotsLeft: dots.size };
